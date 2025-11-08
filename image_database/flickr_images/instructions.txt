@@ -1,0 +1,2 @@
+Placer ici les images de la base de données au format jpg, le nom des fichiers ne devrait pas avoir d'importance.
+Pour des tests attention à ne pas mettre trop d'images, le script va créer ~50 fois leur nombre en patchs (10 patchs par image, bruités 4 fois chacun)
