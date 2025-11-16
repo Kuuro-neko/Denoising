@@ -1,0 +1,8 @@
+*/patches/*
+*/patchesx64/*
+*/patchesx64/clean/*
+*/patchesx64/noisy/*
+*/flickr_images/*
+*.pth
+__pycache__/
+demo_out.*

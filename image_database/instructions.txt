@@ -1,0 +1,15 @@
+Placer dans image_database/flickr_images les images de la base de données au format jpg, le nom des fichiers ne devrait pas avoir d'importance.
+Pour des tests attention à ne pas mettre trop d'images, le script va créer ~50 fois leur nombre en patchs (10 patchs par image, bruités 4 fois chacun)
+
+
+
+
+
+@Thibaut pour le VAE :
+
+python all_preprocessing.py (attention ça supprime une partie de flickr_images pour en garder que 5000) pour créer le dataset 64x64 à utiliser avec le VAE
+
+cd ../
+
+python .\vae.py --epochs 32 --batch-size 64 --latent-dim 1024 --beta 0.01 --lr 5e-4 --data-root .\image_database\patchesx64\
+python ./vae.py --epochs 32 --batch-size 64 --latent-dim 1024 --beta 0.01 --lr 5e-4 --data-root ./image_database/patchesx64/
