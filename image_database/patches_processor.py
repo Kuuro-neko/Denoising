@@ -12,11 +12,11 @@ class ImagePatchGenerator:
         
         # Créer les dossiers de sortie
         self.dirs = {
-            'clean': self.output_dir / 'clean',
-            'gaussian': self.output_dir / 'gaussian',
-            'poisson': self.output_dir / 'poisson',
-            'salt_pepper': self.output_dir / 'salt_pepper',
-            'speckle': self.output_dir / 'speckle'
+            'clean': self.output_dir,
+            'gaussian': self.output_dir,
+            'poisson': self.output_dir,
+            'salt_pepper': self.output_dir,
+            'speckle': self.output_dir
         }
         
         for dir_path in self.dirs.values():

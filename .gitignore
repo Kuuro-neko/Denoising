@@ -1,8 +1,10 @@
 */patches/*
+!*/patches/*.txt
 */patchesx64/*
+!*/patchesx64/*.txt
 */patchesx64/clean/*
 */patchesx64/noisy/*
 */flickr_images/*
-*.pth
+!*/flickr_images/*.txt
 __pycache__/
 demo_out.*
