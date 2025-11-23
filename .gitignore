@@ -8,3 +8,5 @@
 !*/flickr_images/*.txt
 __pycache__/
 demo_out.*
+*.pth
+gan_denoising_results.png

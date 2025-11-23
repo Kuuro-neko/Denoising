@@ -276,7 +276,7 @@ def visualize_results(model, dataset, num_samples=3):
 # ============= Script principal =============
 def main():
     # Configuration
-    DATA_DIR = "./patches"  # À adapter selon le dossier contenant vos patchs
+    DATA_DIR = "./image_database/patches"  # À adapter selon le dossier contenant vos patchs
     BATCH_SIZE = 16
     EPOCHS = 5
     LEARNING_RATE = 1e-3
