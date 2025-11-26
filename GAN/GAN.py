@@ -184,7 +184,7 @@ def train_model(
     save_path="unet_gan_generator.pth"
 ):
     criterion_GAN = nn.BCEWithLogitsLoss()
-    criterion_MSE = nn.MSELoss()
+    criterion_MSE = nn.L1Loss()
 
     opt_G = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
     opt_D = optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
@@ -297,8 +297,8 @@ def visualize_results(generator, dataset, num_samples=5):
 def main():
     DATA_DIR = "./image_database/patches"
     BATCH_SIZE = 32
-    EPOCHS = 30
-    LR = 2e-4
+    EPOCHS = 16
+    LR = 1.5e-3
     TRAIN_SPLIT = 0.8
 
     transform = transforms.Compose([
@@ -309,7 +309,7 @@ def main():
         clean_dir=DATA_DIR,
         noise_types=['gauss', 'poisson', 'sap', 'speckle'],
         transform=transform,
-        num_images=2533
+        num_images=8000
     )
 
     train_len = int(len(full_dataset) * TRAIN_SPLIT)

@@ -10,3 +10,4 @@ __pycache__/
 demo_out.*
 *.pth
 gan_denoising_results.png
+denoised_image.jpg
