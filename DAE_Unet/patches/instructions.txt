@@ -1,0 +1,7 @@
+Placer ici les patchs d'entraînement nommés de la manière suivante :
+Images clean : "000001.jpg", "000002.jpg"... (six chiffres)
+Images bruitées : "prefixe_bruit_000001.jpg"...
+
+Les préfixes de bruit sont "gauss", "poisson", "sap" et "speckle", possible de les changer dans le script DAE.py.
+
+Ne pas oublier d'initialiser num_images dans le script DAE.py avec le nombre d'images clean.
