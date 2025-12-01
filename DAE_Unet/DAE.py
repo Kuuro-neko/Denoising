@@ -216,9 +216,13 @@ class UNet(nn.Module):
         
         return self.final_conv(x)
 
+def charbonnier(img_clean, img_noisy):
+    epsilon=1e-3
+    return torch.sqrt(torch.square(img_clean-img_noisy)+epsilon*epsilon)
+
 
 # ============= Entraînement =============
-def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3, save_path='unet_denoiser.pth'):
+def train_model(model, train_loader, val_loader, dataset, epochs=50, lr=1e-3, save_path='unet_denoiser.pth'):
     """Entraîne le modèle U-Net avec Perceptual Loss"""
     
     # lambda_adv=0 car il n'y a pas de discriminateur pour le moment
@@ -230,6 +234,8 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3, save_path='
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
+
+    nb=0
     
     for epoch in range(epochs):
         print(f"\n{'='*60}")
@@ -305,6 +311,51 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3, save_path='
             torch.save(model.state_dict(), save_path)
             print(f"  ✓ Modèle sauvegardé (meilleure validation loss: {best_val_loss:.6f})")
         print(f"{'─'*60}")
+
+        #TESTS
+        num_samples=6
+        model.eval()
+        fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
+        
+        if num_samples == 1:
+            axes = axes.reshape(1, -1)
+        
+        indices = np.random.choice(len(dataset), num_samples, replace=False)
+        
+        with torch.no_grad():
+            for i, idx in enumerate(indices):
+                noisy, clean = dataset[idx]
+                noisy_input = noisy.unsqueeze(0).to(device)
+                denoised = model(noisy_input).cpu().squeeze(0)
+                
+                # Convertir en images affichables
+                noisy_img = noisy.permute(1, 2, 0).numpy()
+                clean_img = clean.permute(1, 2, 0).numpy()
+                denoised_img = denoised.permute(1, 2, 0).numpy()
+                
+                # Clipper les valeurs
+                noisy_img = np.clip(noisy_img, 0, 1)
+                clean_img = np.clip(clean_img, 0, 1)
+                denoised_img = np.clip(denoised_img, 0, 1)
+                
+                axes[i, 0].imshow(noisy_img)
+                axes[i, 0].set_title('Image bruitée ')
+                # +str(charbonnier(clean,noisy))
+                axes[i, 0].axis('off')
+                
+                axes[i, 1].imshow(denoised_img)
+                axes[i, 1].set_title('Débruitée ')
+                # +str(charbonnier(clean,denoised))
+                axes[i, 1].axis('off')
+                
+                axes[i, 2].imshow(clean_img)
+                axes[i, 2].set_title('Image propre')
+                axes[i, 2].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig('denoising_results'+str(nb)+'.png', dpi=150, bbox_inches='tight')
+
+        nb+=1
     
     return train_losses, val_losses
 
@@ -358,24 +409,30 @@ def main():
     # Configuration
     DATA_DIR = "./image_database/patches"  # À adapter selon le dossier contenant vos patchs
     BATCH_SIZE = 16
-    EPOCHS = 5
+    EPOCHS = 16
     LEARNING_RATE = 1e-3
     TRAIN_SPLIT = 0.8
-    RESUME_TRAINING = False  # Mettre True pour continuer un entraînement
+    RESUME_TRAINING = True  # Mettre True pour continuer un entraînement
     MODEL_PATH = "unet_denoiser.pth"  # Chemin du modèle à charger
+
+    print("debut 1")
     
     # Transformations
     transform = transforms.Compose([
         transforms.ToTensor(),
     ])
+
+    print("debut 2")
     
     # Charger le dataset
     full_dataset = DenoisingDataset(
         clean_dir=DATA_DIR,
         noise_types=['gauss', 'poisson', 'sap', 'speckle'],
         transform=transform,
-        num_images=2533 # À adapter au nombre de patchs dans le dossier /patches
+        num_images=637965 # À adapter au nombre de patchs dans le dossier /patches
     )
+
+    print("debut 3")
     
     # Diviser en train/val
     train_size = int(TRAIN_SPLIT * len(full_dataset))
@@ -404,7 +461,7 @@ def main():
     # Entraîner
     print("\n=== Début de l'entraînement ===\n")
     train_losses, val_losses = train_model(
-        model, train_loader, val_loader, 
+        model, train_loader, val_loader, full_dataset,
         epochs=EPOCHS, lr=LEARNING_RATE
     )
     
