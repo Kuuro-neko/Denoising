@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torchvision.models as models
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
@@ -74,6 +75,75 @@ class DenoisingDataset(Dataset):
             clean_img = self.transform(clean_img)
         
         return noisy_img, clean_img
+
+# =============Fonction de perte ===============
+
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        # Charger VGG19 pré-entraîné sur ImageNet
+        vgg = models.vgg19(pretrained=True).features
+        
+        # On garde les couches jusqu'à la 35ème
+        # Cela capture les structures de haut niveau.
+        self.feature_extractor = nn.Sequential(*list(vgg.children())[:35]).to(device).eval()
+        
+        # Geler les paramètres (on ne veut pas entraîner VGG, juste l'utiliser)
+        for param in self.feature_extractor.parameters():
+            param.requires_grad = False
+            
+        # Normalisation standard ImageNet (nécessaire car VGG a appris avec ces valeurs)
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device))
+
+    def forward(self, input_img, target_img):
+        # On s'assure que l'entrée est dans la bonne range pour la normalisation
+        
+        input_norm = (input_img - self.mean) / self.std
+        target_norm = (target_img - self.mean) / self.std
+        
+        input_features = self.feature_extractor(input_norm)
+        target_features = self.feature_extractor(target_norm)
+        
+        # On calcule la distance L1 entre les features
+        return nn.functional.l1_loss(input_features, target_features)
+
+class GeneratorLoss(nn.Module):
+    def __init__(self, device, lambda_pixel=1.0, lambda_percep=0.1, lambda_adv=0.001):
+        super().__init__()
+        self.vgg_loss = VGGPerceptualLoss(device)
+        self.pixel_loss = nn.L1Loss()
+        
+        # Poids des différentes pertes (Hyperparamètres à ajuster)
+        self.w_pixel = lambda_pixel
+        self.w_percep = lambda_percep
+        self.w_adv = lambda_adv
+
+    def forward(self, fake_img, real_img, discriminator_pred=None):
+        """
+        fake_img: Image sortie du générateur (U-Net)
+        real_img: Image cible (Ground Truth)
+        discriminator_pred: pour implémenter le GAN
+        """
+        
+        # 1. Perte Pixel (contenu bas niveau)
+        l_pixel = self.pixel_loss(fake_img, real_img)
+        
+        # 2. Perte Perceptuelle (contenu haut niveau / Texture)
+        l_percep = self.vgg_loss(fake_img, real_img)
+        
+        # 3. Perte Adversariale
+        l_adv = 0.0
+        if discriminator_pred is not None:
+            # On veut que le discriminateur prédise 1 (Vrai) pour notre fausse image
+            l_adv = nn.functional.binary_cross_entropy_with_logits(
+                discriminator_pred, torch.ones_like(discriminator_pred)
+            )
+
+        # Somme pondérée
+        total_loss = (self.w_pixel * l_pixel) + (self.w_percep * l_percep) + (self.w_adv * l_adv)
+        
+        return total_loss, l_pixel, l_percep, l_adv
 
 
 # ============= Architecture U-Net =============
@@ -149,8 +219,11 @@ class UNet(nn.Module):
 
 # ============= Entraînement =============
 def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3, save_path='unet_denoiser.pth'):
-    """Entraîne le modèle U-Net"""
-    criterion = nn.MSELoss()
+    """Entraîne le modèle U-Net avec Perceptual Loss"""
+    
+    # lambda_adv=0 car il n'y a pas de discriminateur pour le moment
+    criterion = GeneratorLoss(device=device, lambda_pixel=1.0, lambda_percep=0.1, lambda_adv=0.0).to(device)
+    
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
     
@@ -166,6 +239,8 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3, save_path='
         # Phase d'entraînement
         model.train()
         train_loss = 0.0
+        pixel_loss_acc = 0.0 
+        vgg_loss_acc = 0.0   
         
         print("Entraînement en cours...")
         for batch_idx, (noisy, clean) in enumerate(train_loader):
@@ -173,17 +248,23 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3, save_path='
             
             optimizer.zero_grad()
             output = model(noisy)
-            loss = criterion(output, clean)
+            
+            loss, l_pixel, l_percep, l_adv = criterion(output, clean, discriminator_pred=None)
+            
             loss.backward()
             optimizer.step()
             
             train_loss += loss.item()
+            pixel_loss_acc += l_pixel.item()
+            vgg_loss_acc += l_percep.item()
             
             # Afficher la progression
             if (batch_idx + 1) % max(1, len(train_loader) // 10) == 0 or (batch_idx + 1) == len(train_loader):
                 progress = (batch_idx + 1) / len(train_loader) * 100
                 current_loss = train_loss / (batch_idx + 1)
-                print(f"  Batch [{batch_idx+1}/{len(train_loader)}] ({progress:.1f}%) - Loss: {current_loss:.6f}")
+                # On affiche le détail pour voir si VGG domine trop ou pas assez
+                print(f"  Batch [{batch_idx+1}/{len(train_loader)}] ({progress:.1f}%) "
+                      f"- Total: {current_loss:.4f} | Pixel: {l_pixel.item():.4f} | VGG: {l_percep.item():.4f}")
         
         train_loss /= len(train_loader)
         train_losses.append(train_loss)
@@ -197,14 +278,14 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3, save_path='
             for batch_idx, (noisy, clean) in enumerate(val_loader):
                 noisy, clean = noisy.to(device), clean.to(device)
                 output = model(noisy)
-                loss = criterion(output, clean)
+                
+                # Même chose pour la validation
+                loss, l_pixel, l_percep, l_adv = criterion(output, clean, discriminator_pred=None)
+                
                 val_loss += loss.item()
                 
-                # Afficher la progression
-                if (batch_idx + 1) % max(1, len(val_loader) // 5) == 0 or (batch_idx + 1) == len(val_loader):
-                    progress = (batch_idx + 1) / len(val_loader) * 100
-                    current_loss = val_loss / (batch_idx + 1)
-                    print(f"  Batch [{batch_idx+1}/{len(val_loader)}] ({progress:.1f}%) - Loss: {current_loss:.6f}")
+                if (batch_idx + 1) % max(1, len(val_loader) // 5) == 0:
+                    print(f"  Batch [{batch_idx+1}/{len(val_loader)}] - Val Loss: {val_loss / (batch_idx + 1):.6f}")
         
         val_loss /= len(val_loader)
         val_losses.append(val_loss)
@@ -215,11 +296,10 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3, save_path='
         
         print(f"\n{'─'*60}")
         print(f"Résumé Epoch {epoch+1}:")
-        print(f"  Train Loss: {train_loss:.6f}")
+        print(f"  Train Loss: {train_loss:.6f} (Pixel: {pixel_loss_acc/len(train_loader):.4f}, VGG: {vgg_loss_acc/len(train_loader):.4f})")
         print(f"  Val Loss:   {val_loss:.6f}")
         print(f"  Learning Rate: {current_lr:.2e}")
         
-        # Sauvegarder le meilleur modèle
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), save_path)
@@ -331,7 +411,7 @@ def main():
     # Visualiser les résultats
     print("\n=== Visualisation des résultats ===\n")
     model.load_state_dict(torch.load('unet_denoiser.pth'))
-    visualize_results(model, full_dataset, num_samples=3)
+    visualize_results(model, full_dataset, num_samples=10)
     
     # Plot des pertes
     plt.figure(figsize=(10, 5))
