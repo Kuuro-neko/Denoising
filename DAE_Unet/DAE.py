@@ -107,6 +107,10 @@ class VGGPerceptualLoss(nn.Module):
         
         # On calcule la distance L1 entre les features
         return nn.functional.l1_loss(input_features, target_features)
+    
+def charbonnier(img_clean, img_noisy):
+    epsilon=1e-3
+    return torch.sqrt(torch.square(img_clean-img_noisy)+epsilon*epsilon).mean()
 
 class GeneratorLoss(nn.Module):
     def __init__(self, device, lambda_pixel=1.0, lambda_percep=0.1, lambda_adv=0.001):
@@ -129,6 +133,8 @@ class GeneratorLoss(nn.Module):
         # 1. Perte Pixel (contenu bas niveau)
         l_pixel = self.pixel_loss(fake_img, real_img)
         
+        l_charbonnier=charbonnier(fake_img, real_img)
+        
         # 2. Perte Perceptuelle (contenu haut niveau / Texture)
         l_percep = self.vgg_loss(fake_img, real_img)
         
@@ -143,7 +149,7 @@ class GeneratorLoss(nn.Module):
         # Somme pondérée
         total_loss = (self.w_pixel * l_pixel) + (self.w_percep * l_percep) + (self.w_adv * l_adv)
         
-        return total_loss, l_pixel, l_percep, l_adv
+        return total_loss, l_pixel, l_percep, l_adv, l_charbonnier
 
 
 # ============= Architecture U-Net =============
@@ -216,9 +222,7 @@ class UNet(nn.Module):
         
         return self.final_conv(x)
 
-def charbonnier(img_clean, img_noisy):
-    epsilon=1e-3
-    return torch.sqrt(torch.square(img_clean-img_noisy)+epsilon*epsilon)
+
 
 
 # ============= Entraînement =============
@@ -234,6 +238,9 @@ def train_model(model, train_loader, val_loader, dataset, epochs=50, lr=1e-3, sa
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
+    
+    train_charbonniers=[]
+    val_charbonniers=[]
 
     nb=0
     
@@ -248,6 +255,8 @@ def train_model(model, train_loader, val_loader, dataset, epochs=50, lr=1e-3, sa
         pixel_loss_acc = 0.0 
         vgg_loss_acc = 0.0   
         
+        train_charbonnier=0.0
+        
         print("Entraînement en cours...")
         for batch_idx, (noisy, clean) in enumerate(train_loader):
             noisy, clean = noisy.to(device), clean.to(device)
@@ -255,7 +264,7 @@ def train_model(model, train_loader, val_loader, dataset, epochs=50, lr=1e-3, sa
             optimizer.zero_grad()
             output = model(noisy)
             
-            loss, l_pixel, l_percep, l_adv = criterion(output, clean, discriminator_pred=None)
+            loss, l_pixel, l_percep, l_adv, l_charbonnier = criterion(output, clean, discriminator_pred=None)
             
             loss.backward()
             optimizer.step()
@@ -263,6 +272,7 @@ def train_model(model, train_loader, val_loader, dataset, epochs=50, lr=1e-3, sa
             train_loss += loss.item()
             pixel_loss_acc += l_pixel.item()
             vgg_loss_acc += l_percep.item()
+            train_charbonnier+=l_charbonnier
             
             # Afficher la progression
             if (batch_idx + 1) % max(1, len(train_loader) // 10) == 0 or (batch_idx + 1) == len(train_loader):
@@ -270,14 +280,18 @@ def train_model(model, train_loader, val_loader, dataset, epochs=50, lr=1e-3, sa
                 current_loss = train_loss / (batch_idx + 1)
                 # On affiche le détail pour voir si VGG domine trop ou pas assez
                 print(f"  Batch [{batch_idx+1}/{len(train_loader)}] ({progress:.1f}%) "
-                      f"- Total: {current_loss:.4f} | Pixel: {l_pixel.item():.4f} | VGG: {l_percep.item():.4f}")
+                      f"- Total: {current_loss:.4f} | Pixel: {l_pixel.item():.4f} | VGG: {l_percep.item():.4f} | Charbonnier: {l_charbonnier:.4f}")
         
         train_loss /= len(train_loader)
         train_losses.append(train_loss)
         
+        train_charbonnier/=len(train_loader)
+        train_charbonniers.append(train_charbonnier)
+        
         # Phase de validation
         model.eval()
         val_loss = 0.0
+        val_charbonnier=0.0
         
         print("\nValidation en cours...")
         with torch.no_grad():
@@ -286,9 +300,11 @@ def train_model(model, train_loader, val_loader, dataset, epochs=50, lr=1e-3, sa
                 output = model(noisy)
                 
                 # Même chose pour la validation
-                loss, l_pixel, l_percep, l_adv = criterion(output, clean, discriminator_pred=None)
+                loss, l_pixel, l_percep, l_adv, l_charbonnier = criterion(output, clean, discriminator_pred=None)
                 
                 val_loss += loss.item()
+                
+                val_charbonnier+=l_charbonnier
                 
                 if (batch_idx + 1) % max(1, len(val_loader) // 5) == 0:
                     print(f"  Batch [{batch_idx+1}/{len(val_loader)}] - Val Loss: {val_loss / (batch_idx + 1):.6f}")
@@ -296,13 +312,16 @@ def train_model(model, train_loader, val_loader, dataset, epochs=50, lr=1e-3, sa
         val_loss /= len(val_loader)
         val_losses.append(val_loss)
         
+        val_charbonnier/=len(val_loader)
+        val_charbonniers.append(val_charbonnier)
+        
         # Ajuster le taux d'apprentissage
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]['lr']
         
         print(f"\n{'─'*60}")
         print(f"Résumé Epoch {epoch+1}:")
-        print(f"  Train Loss: {train_loss:.6f} (Pixel: {pixel_loss_acc/len(train_loader):.4f}, VGG: {vgg_loss_acc/len(train_loader):.4f})")
+        print(f"  Train Loss: {train_loss:.6f} (Pixel: {pixel_loss_acc/len(train_loader):.4f}, VGG: {vgg_loss_acc/len(train_loader):.4f}), Charbonnier: {val_charbonnier:.6f}")
         print(f"  Val Loss:   {val_loss:.6f}")
         print(f"  Learning Rate: {current_lr:.2e}")
         
@@ -339,13 +358,13 @@ def train_model(model, train_loader, val_loader, dataset, epochs=50, lr=1e-3, sa
                 denoised_img = np.clip(denoised_img, 0, 1)
                 
                 axes[i, 0].imshow(noisy_img)
-                axes[i, 0].set_title('Image bruitée ')
-                # +str(charbonnier(clean,noisy))
+                axes[i, 0].set_title('Image bruitée')
+                # , charbonnier : '+str(charbonnier(clean,noisy))
                 axes[i, 0].axis('off')
                 
                 axes[i, 1].imshow(denoised_img)
-                axes[i, 1].set_title('Débruitée ')
-                # +str(charbonnier(clean,denoised))
+                axes[i, 1].set_title('Débruitée')
+                # , charbonnier : '+str(charbonnier(clean,denoised))
                 axes[i, 1].axis('off')
                 
                 axes[i, 2].imshow(clean_img)
@@ -412,7 +431,7 @@ def main():
     EPOCHS = 16
     LEARNING_RATE = 1e-3
     TRAIN_SPLIT = 0.8
-    RESUME_TRAINING = True  # Mettre True pour continuer un entraînement
+    RESUME_TRAINING = False  # Mettre True pour continuer un entraînement
     MODEL_PATH = "unet_denoiser.pth"  # Chemin du modèle à charger
 
     print("debut 1")
