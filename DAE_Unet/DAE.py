@@ -412,6 +412,8 @@ def main():
     print("\n=== Visualisation des résultats ===\n")
     model.load_state_dict(torch.load('unet_denoiser.pth'))
     visualize_results(model, full_dataset, num_samples=10)
+
+    
     
     # Plot des pertes
     plt.figure(figsize=(10, 5))

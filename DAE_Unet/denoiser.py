@@ -5,6 +5,10 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import numpy as np
 
+from skimage.metrics import peak_signal_noise_ratio as psnr, structural_similarity as ssim
+import pandas as pd
+import os
+
 # ============= Importer l'architecture U-Net =============
 class DoubleConv(nn.Module):
     """Bloc de deux convolutions avec BatchNorm et ReLU"""
@@ -220,9 +224,10 @@ if __name__ == "__main__":
     print("=" * 60)
     print("1. Débruiter une seule image")
     print("2. Débruiter un dossier entier")
+    print("3. Débruiter un dossier et afficher des graphiques")
     print("=" * 60)
     
-    choice = input("\nVotre choix (1/2): ")
+    choice = input("\nVotre choix (1/2/3): ")
     
     if choice == "1":
         print("\n--- Débruitage d'une image ---")
@@ -236,6 +241,100 @@ if __name__ == "__main__":
         input_folder = input("Dossier contenant les images bruitées: ")
         output_folder = input("Dossier de sortie pour les images débruitées: ")
         denoise_folder(input_folder, output_folder)
+
+    elif choice == "3":
+        print("\n --- Graphiques ---")
+        input_folder = "./image_database/sample/"
+        output_folder = "./image_database/denoised_sample/"
+        denoise_folder(input_folder, output_folder)
+        clean_folder = input_folder + "clean/"
+
+        # Initialisation des listes pour les résultats
+        noise_types = ['gauss', 'poisson', 'sap', 'speckle']
+        psnr_values = {noise: [] for noise in noise_types}
+        ssim_values = {noise: [] for noise in noise_types}
+
+        # Parcourir les types de bruit
+        for noise in noise_types:
+            for filename in os.listdir(clean_folder):
+                if filename.endswith(".jpg"):
+                    clean_path = os.path.join(clean_folder, filename)
+                    noisy_path = os.path.join(input_folder, f"{noise}_{filename}")
+                    denoised_path = os.path.join(output_folder, f"denoised_{noise}_{filename}")
+
+                    try:
+                        # Charger les images
+                        clean_image = np.array(Image.open(clean_path).convert('RGB')) / 255.0
+                        noisy_image = np.array(Image.open(noisy_path).convert('RGB')) / 255.0
+                        denoised_image = np.array(Image.open(denoised_path).convert('RGB')) / 255.0
+
+                        # Calculer PSNR et SSIM
+                        psnr_values[noise].append(psnr(clean_image, denoised_image))
+                        ssim_values[noise].append(ssim(clean_image, denoised_image))
+
+                    except Exception as e:
+                        print(f"Erreur avec {filename} pour le bruit {noise}: {e}")
+
+        # Moyennes des métriques
+        psnr_means = {noise: np.mean(values) for noise, values in psnr_values.items()}
+        ssim_means = {noise: np.mean(values) for noise, values in ssim_values.items()}
+
+        # Création d'un DataFrame pour les graphiques
+        df = pd.DataFrame({
+            "Type de bruit": noise_types,
+            "PSNR": [psnr_means[noise] for noise in noise_types],
+            "SSIM": [ssim_means[noise] for noise in noise_types]
+        })
+
+        # Tracer les graphiques
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+        axes[0].bar(df["Type de bruit"], df["PSNR"], color='skyblue')
+        axes[0].set_title("PSNR par type de bruit")
+        axes[0].set_ylabel("PSNR")
+        axes[0].set_xlabel("Type de bruit")
+
+        axes[1].bar(df["Type de bruit"], df["SSIM"], color='lightgreen')
+        axes[1].set_title("SSIM par type de bruit")
+        axes[1].set_ylabel("SSIM")
+        axes[1].set_xlabel("Type de bruit")
+
+        plt.tight_layout()
+        plt.savefig('metrics_comparison.png', dpi=150, bbox_inches='tight')
+        plt.show()
+
+        # Compilation des images et affichage des métriques
+        fig, axes = plt.subplots(len(os.listdir(clean_folder)), 5, figsize=(20, 4 * len(os.listdir(clean_folder))))
+
+        for i, filename in enumerate(os.listdir(clean_folder)):
+            if filename.endswith(".jpg"):
+                clean_path = os.path.join(clean_folder, filename)
+                clean_image = Image.open(clean_path).convert('RGB')
+
+                # Afficher l'image propre
+                axes[i, 0].imshow(clean_image)
+                axes[i, 0].set_title("Clean")
+                axes[i, 0].axis('off')
+
+                for j, noise in enumerate(['gauss', 'poisson', 'sap', 'speckle']):
+                    denoised_path = os.path.join(output_folder, f"denoised_{noise}_{filename}")
+
+                    try:
+                        denoised_image = Image.open(denoised_path).convert('RGB')
+
+                        #
+                        psnr_value = psnr(np.array(clean_image) / 255.0, np.array(denoised_image) / 255.0)
+                        print(f"{filename} - {noise}: PSNR = {psnr_value:.2f}")
+                        axes[i, j + 1].imshow(denoised_image)
+                        axes[i, j + 1].set_title(f"{noise}\nPSNR: {psnr_value:.2f}")
+                        axes[i, j + 1].axis('off')
+
+                    except Exception as e:
+                        print(f"Erreur avec {filename} pour le bruit {noise}: {e}")
+
+        plt.tight_layout()
+        plt.savefig('image_comparison.png', dpi=150, bbox_inches='tight')
+        plt.show()
         
     else:
         print("Choix invalide!")

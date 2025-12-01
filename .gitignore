@@ -11,3 +11,8 @@ demo_out.*
 *.pth
 gan_denoising_results.png
 denoised_image.jpg
+denoising_results.png
+image_comparison.png
+metrics_comparison.png
+training_curves.png
+*/denoised_sample/*
