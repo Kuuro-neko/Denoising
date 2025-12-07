@@ -11,6 +11,12 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 #import torch_directml
 
+import csv
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
+import collections
+from tqdm import tqdm
+
 # ============= Configuration du device (AMD/CPU) =============
 def get_device():
     """Détecte le meilleur device disponible"""
@@ -55,7 +61,7 @@ class DenoisingDataset(Dataset):
                     noisy_path = self.clean_dir / noisy_name
                     
                     if noisy_path.exists():
-                        self.samples.append((noisy_path, clean_path))
+                        self.samples.append((noisy_path, clean_path, noise))
         
         print(f"Dataset chargé: {len(self.samples)} paires d'images")
     
@@ -63,7 +69,7 @@ class DenoisingDataset(Dataset):
         return len(self.samples)
     
     def __getitem__(self, idx):
-        noisy_path, clean_path = self.samples[idx]
+        noisy_path, clean_path, noise_type = self.samples[idx]
         
         # Charger les images
         noisy_img = Image.open(noisy_path).convert('RGB')
@@ -74,9 +80,75 @@ class DenoisingDataset(Dataset):
             noisy_img = self.transform(noisy_img)
             clean_img = self.transform(clean_img)
         
-        return noisy_img, clean_img
+        return noisy_img, clean_img, noise_type
 
-# =============Fonction de perte ===============
+def calculate_metrics_on_batch(clean_batch, denoised_batch):
+    """
+    Calcule PSNR et SSIM moyens sur un batch.
+    Suppose des tenseurs PyTorch en entrée [B, C, H, W] normalisés.
+    """
+    # On passe sur CPU et en Numpy
+    clean_np = clean_batch.detach().cpu().numpy()
+    denoised_np = denoised_batch.detach().cpu().numpy()
+        
+    # Clip pour être sûr d'être dans [0, 1]
+    clean_np = np.clip(clean_np, 0, 1)
+    denoised_np = np.clip(denoised_np, 0, 1)
+    
+    psnr_val = 0.0
+    ssim_val = 0.0
+    batch_size = clean_np.shape[0]
+    
+    for i in range(batch_size):
+        p = psnr(clean_np[i], denoised_np[i], data_range=1.0)
+        s = ssim(clean_np[i], denoised_np[i], data_range=1.0, channel_axis=0)
+        psnr_val += p
+        ssim_val += s
+        
+    return psnr_val / batch_size, ssim_val / batch_size
+
+def calculate_metrics_individual(clean_batch, denoised_batch):
+    """
+    Retourne des LISTES de métriques (une valeur par image du batch)
+    au lieu de la moyenne globale.
+    """
+    clean_np = clean_batch.detach().cpu().numpy()
+    denoised_np = denoised_batch.detach().cpu().numpy()
+    
+    # Clip [0, 1]
+    clean_np = np.clip(clean_np, 0, 1)
+    denoised_np = np.clip(denoised_np, 0, 1)
+    
+    psnr_list = []
+    ssim_list = []
+    batch_size = clean_np.shape[0]
+    
+    for i in range(batch_size):
+        # Data range 1.0 car images normalisées entre 0 et 1
+        p = psnr(clean_np[i], denoised_np[i], data_range=1.0)
+        s = ssim(clean_np[i], denoised_np[i], data_range=1.0, channel_axis=0)
+        psnr_list.append(p)
+        ssim_list.append(s)
+        
+    return psnr_list, ssim_list
+
+def log_to_csv(filepath, data, header=None, mode='a'):
+    """Écrit une ligne dans un CSV. Crée le fichier avec header si nouveau."""
+    file_exists = os.path.isfile(filepath)
+    
+    # Si on reprend l'entraînement (mode='a') mais que le fichier n'existe pas, 
+    # on le crée comme si c'était 'w'
+    if not file_exists and mode == 'a':
+        mode = 'w'
+        
+    with open(filepath, mode, newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists and header is not None:
+            writer.writerow(header)
+        writer.writerow(data)
+
+
+#============Fonction de perte ===============
 
 class VGGPerceptualLoss(nn.Module):
     def __init__(self, device):
@@ -107,10 +179,6 @@ class VGGPerceptualLoss(nn.Module):
         
         # On calcule la distance L1 entre les features
         return nn.functional.l1_loss(input_features, target_features)
-    
-def charbonnier(img_clean, img_noisy):
-    epsilon=1e-3
-    return torch.sqrt(torch.square(img_clean-img_noisy)+epsilon*epsilon).mean()
 
 class GeneratorLoss(nn.Module):
     def __init__(self, device, lambda_pixel=1.0, lambda_percep=0.1, lambda_adv=0.001):
@@ -133,8 +201,6 @@ class GeneratorLoss(nn.Module):
         # 1. Perte Pixel (contenu bas niveau)
         l_pixel = self.pixel_loss(fake_img, real_img)
         
-        l_charbonnier=charbonnier(fake_img, real_img)
-        
         # 2. Perte Perceptuelle (contenu haut niveau / Texture)
         l_percep = self.vgg_loss(fake_img, real_img)
         
@@ -149,7 +215,7 @@ class GeneratorLoss(nn.Module):
         # Somme pondérée
         total_loss = (self.w_pixel * l_pixel) + (self.w_percep * l_percep) + (self.w_adv * l_adv)
         
-        return total_loss, l_pixel, l_percep, l_adv, l_charbonnier
+        return total_loss, l_pixel, l_percep, l_adv
 
 
 # ============= Architecture U-Net =============
@@ -160,10 +226,10 @@ class DoubleConv(nn.Module):
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False  ),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=False)
         )
     
     def forward(self, x):
@@ -222,161 +288,357 @@ class UNet(nn.Module):
         
         return self.final_conv(x)
 
+class Discriminator(nn.Module):
+    def __init__(self, input_channels=3):
+        super(Discriminator, self).__init__()
+        
+        def discriminator_block(in_filters, out_filters, normalization=True):
+            """Returns layers of each discriminator block"""
+            layers = [nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1)]
+            if normalization:
+                layers.append(nn.InstanceNorm2d(out_filters))
+            layers.append(nn.LeakyReLU(0.2, inplace=False))
+            return layers
 
+        self.model = nn.Sequential(
+            *discriminator_block(input_channels, 64, normalization=False), # Pas de BN sur la 1ere couche
+            *discriminator_block(64, 128),
+            *discriminator_block(128, 256),
+            *discriminator_block(256, 512),
+            #nn.ZeroPad2d((1, 0, 1, 0)),
+            nn.Conv2d(512, 1, 4, stride=1, padding=1, bias=False) 
+            # La sortie n'est pas une seule valeur, mais une carte de caractéristiques (ex: 16x16 valeurs)
+        )
 
+    def forward(self, img):
+        return self.model(img)
 
-# ============= Entraînement =============
-def train_model(model, train_loader, val_loader, dataset, epochs=50, lr=1e-3, save_path='unet_denoiser.pth'):
-    """Entraîne le modèle U-Net avec Perceptual Loss"""
+def train_gan_model(generator, discriminator, train_loader, val_loader, 
+                    epochs=50, lr=1e-3, 
+                    save_path_G='unet_denoiser.pth', 
+                    save_path_D='discriminator.pth',
+                    device='cuda'):
     
-    # lambda_adv=0 car il n'y a pas de discriminateur pour le moment
-    criterion = GeneratorLoss(device=device, lambda_pixel=1.0, lambda_percep=0.1, lambda_adv=0.0).to(device)
+    # 1. Configuration des pertes
+    criterion_G = GeneratorLoss(device=device, lambda_pixel=1.0, lambda_percep=0.1, lambda_adv=0.01).to(device)
+    criterion_D = nn.BCEWithLogitsLoss().to(device)
     
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+    # 2. Optimiseurs séparés
+    optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
     
-    train_losses = []
-    val_losses = []
+    scheduler_G = optim.lr_scheduler.ReduceLROnPlateau(optimizer_G, mode='min', patience=5, factor=0.5)
+    
+    train_losses_G = []
+    val_losses_G = []
+    train_losses_D = []
     best_val_loss = float('inf')
-    
-    train_charbonniers=[]
-    val_charbonniers=[]
-
-    nb=0
     
     for epoch in range(epochs):
         print(f"\n{'='*60}")
         print(f"EPOCH {epoch+1}/{epochs}")
         print(f"{'='*60}")
         
-        # Phase d'entraînement
-        model.train()
-        train_loss = 0.0
+        # --- Phase d'entraînement ---
+        generator.train()
+        discriminator.train()
+        
+        running_loss_G = 0.0
+        running_loss_D = 0.0
         pixel_loss_acc = 0.0 
         vgg_loss_acc = 0.0   
         
-        train_charbonnier=0.0
-        
-        print("Entraînement en cours...")
+        print("Entraînement GAN en cours...")
         for batch_idx, (noisy, clean) in enumerate(train_loader):
-            noisy, clean = noisy.to(device), clean.to(device)
+            noisy = noisy.to(device)
+            clean = clean.to(device)
             
-            optimizer.zero_grad()
-            output = model(noisy)
+            # ==================================================================
+            #  ÉTAPE 1 : Entraîner le Discriminateur (D)
+            # ==================================================================
+            optimizer_D.zero_grad()
             
-            loss, l_pixel, l_percep, l_adv, l_charbonnier = criterion(output, clean, discriminator_pred=None)
+            # A. Sur les images réelles
+            pred_real = discriminator(clean)
+            target_real = torch.ones_like(pred_real) 
+            loss_D_real = criterion_D(pred_real, target_real)
             
-            loss.backward()
-            optimizer.step()
+            # B. Sur les images fausses
+            fake_images = generator(noisy)
+            # IMPORTANT : .detach() pour ne pas modifier le générateur quand on entraîne le discriminateur
+            pred_fake = discriminator(fake_images.detach())
+            target_fake = torch.zeros_like(pred_fake)
+            loss_D_fake = criterion_D(pred_fake, target_fake)
             
-            train_loss += loss.item()
+            # Moyenne des deux pertes
+            loss_D = (loss_D_real + loss_D_fake) * 0.5
+            loss_D.backward()
+            optimizer_D.step()
+            
+            running_loss_D += loss_D.item()
+
+            # ==================================================================
+            #  ÉTAPE 2 : Entraîner le Générateur (G)
+            # ==================================================================
+            optimizer_G.zero_grad()
+            
+            # On ré-évalue le discriminateur sur les fausses images, mais cette fois
+            # sans .detach(), car on veut que l'erreur remonte vers le générateur
+            pred_fake_for_G = discriminator(fake_images)
+            
+            # Calcul de la Loss combinée (Pixel + VGG + Adversarial)
+            # Le but du G est que D dise "Vrai" (donc on vise 1 pour pred_fake_for_G)
+            loss_G, l_pixel, l_percep, l_adv = criterion_G(fake_images, clean, discriminator_pred=pred_fake_for_G)
+            
+            loss_G.backward()
+            optimizer_G.step()
+            
+            running_loss_G += loss_G.item()
             pixel_loss_acc += l_pixel.item()
             vgg_loss_acc += l_percep.item()
-            train_charbonnier+=l_charbonnier
             
-            # Afficher la progression
-            if (batch_idx + 1) % max(1, len(train_loader) // 10) == 0 or (batch_idx + 1) == len(train_loader):
+            # Affichage progression
+            if (batch_idx + 1) % max(1, len(train_loader) // 10) == 0:
                 progress = (batch_idx + 1) / len(train_loader) * 100
-                current_loss = train_loss / (batch_idx + 1)
-                # On affiche le détail pour voir si VGG domine trop ou pas assez
-                print(f"  Batch [{batch_idx+1}/{len(train_loader)}] ({progress:.1f}%) "
-                      f"- Total: {current_loss:.4f} | Pixel: {l_pixel.item():.4f} | VGG: {l_percep.item():.4f} | Charbonnier: {l_charbonnier:.4f}")
+                print(f"  Batch [{batch_idx+1}/{len(train_loader)}] ({progress:.0f}%) "
+                      f"| Loss D: {loss_D.item():.4f} | Loss G: {loss_G.item():.4f} "
+                      f"(Pix:{l_pixel.item():.3f} VGG:{l_percep.item():.3f})")
         
-        train_loss /= len(train_loader)
-        train_losses.append(train_loss)
+        # Moyennes de l'époque
+        epoch_loss_G = running_loss_G / len(train_loader)
+        epoch_loss_D = running_loss_D / len(train_loader)
+        train_losses_G.append(epoch_loss_G)
+        train_losses_D.append(epoch_loss_D)
         
-        train_charbonnier/=len(train_loader)
-        train_charbonniers.append(train_charbonnier)
-        
-        # Phase de validation
-        model.eval()
+        # --- Phase de validation ---
+        # On valide principalement le Générateur (qualité de l'image)
+        generator.eval()
         val_loss = 0.0
-        val_charbonnier=0.0
         
         print("\nValidation en cours...")
         with torch.no_grad():
             for batch_idx, (noisy, clean) in enumerate(val_loader):
                 noisy, clean = noisy.to(device), clean.to(device)
-                output = model(noisy)
-                
-                # Même chose pour la validation
-                loss, l_pixel, l_percep, l_adv, l_charbonnier = criterion(output, clean, discriminator_pred=None)
-                
+                fake_val = generator(noisy)
+                loss, _, _, _ = criterion_G(fake_val, clean, discriminator_pred=None)
                 val_loss += loss.item()
-                
-                val_charbonnier+=l_charbonnier
-                
-                if (batch_idx + 1) % max(1, len(val_loader) // 5) == 0:
-                    print(f"  Batch [{batch_idx+1}/{len(val_loader)}] - Val Loss: {val_loss / (batch_idx + 1):.6f}")
         
         val_loss /= len(val_loader)
-        val_losses.append(val_loss)
+        val_losses_G.append(val_loss)
         
-        val_charbonnier/=len(val_loader)
-        val_charbonniers.append(val_charbonnier)
-        
-        # Ajuster le taux d'apprentissage
-        scheduler.step(val_loss)
-        current_lr = optimizer.param_groups[0]['lr']
+        # Scheduler update
+        scheduler_G.step(val_loss)
+        current_lr = optimizer_G.param_groups[0]['lr']
         
         print(f"\n{'─'*60}")
         print(f"Résumé Epoch {epoch+1}:")
-        print(f"  Train Loss: {train_loss:.6f} (Pixel: {pixel_loss_acc/len(train_loader):.4f}, VGG: {vgg_loss_acc/len(train_loader):.4f}), Charbonnier: {val_charbonnier:.6f}")
-        print(f"  Val Loss:   {val_loss:.6f}")
-        print(f"  Learning Rate: {current_lr:.2e}")
+        print(f"  Train Loss D: {epoch_loss_D:.6f}")
+        print(f"  Train Loss G: {epoch_loss_G:.6f}")
+        print(f"  Val Loss G:   {val_loss:.6f}")
+        print(f"  LR Generator: {current_lr:.2e}")
         
+        # Sauvegarde du meilleur modèle
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), save_path)
-            print(f"  ✓ Modèle sauvegardé (meilleure validation loss: {best_val_loss:.6f})")
+            torch.save(generator.state_dict(), save_path_G)
+            torch.save(discriminator.state_dict(), save_path_D)
+            print(f"  Checkpoint sauvegardé (Best Val: {best_val_loss:.6f})")
+        
         print(f"{'─'*60}")
-
-        #TESTS
-        num_samples=6
-        model.eval()
-        fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
-        
-        if num_samples == 1:
-            axes = axes.reshape(1, -1)
-        
-        indices = np.random.choice(len(dataset), num_samples, replace=False)
-        
-        with torch.no_grad():
-            for i, idx in enumerate(indices):
-                noisy, clean = dataset[idx]
-                noisy_input = noisy.unsqueeze(0).to(device)
-                denoised = model(noisy_input).cpu().squeeze(0)
-                
-                # Convertir en images affichables
-                noisy_img = noisy.permute(1, 2, 0).numpy()
-                clean_img = clean.permute(1, 2, 0).numpy()
-                denoised_img = denoised.permute(1, 2, 0).numpy()
-                
-                # Clipper les valeurs
-                noisy_img = np.clip(noisy_img, 0, 1)
-                clean_img = np.clip(clean_img, 0, 1)
-                denoised_img = np.clip(denoised_img, 0, 1)
-                
-                axes[i, 0].imshow(noisy_img)
-                axes[i, 0].set_title('Image bruitée')
-                # , charbonnier : '+str(charbonnier(clean,noisy))
-                axes[i, 0].axis('off')
-                
-                axes[i, 1].imshow(denoised_img)
-                axes[i, 1].set_title('Débruitée')
-                # , charbonnier : '+str(charbonnier(clean,denoised))
-                axes[i, 1].axis('off')
-                
-                axes[i, 2].imshow(clean_img)
-                axes[i, 2].set_title('Image propre')
-                axes[i, 2].axis('off')
-        
-        plt.tight_layout()
-        plt.savefig('denoising_results'+str(nb)+'.png', dpi=150, bbox_inches='tight')
-
-        nb+=1
     
-    return train_losses, val_losses
+    return train_losses_G, train_losses_D, val_losses_G
+
+def train_gan_model_advanced(generator, discriminator, train_loader, val_loader, 
+                             epochs=50, lr=1e-3, 
+                             resume=False,
+                             checkpoint_dir='checkpoints',
+                             device='cuda'):
+    
+    # --- 1. Préparation ---
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    loss_csv_path = os.path.join(checkpoint_dir, 'training_losses.csv')
+    metrics_csv_path = os.path.join(checkpoint_dir, 'quality_metrics.csv')
+    
+    csv_mode = 'a' if resume else 'w'
+    
+    # Headers Loss (Fixes)
+    loss_header = ['Epoch', 'Loss_D', 'Loss_G', 'Pixel_L1', 'VGG', 'Adv', 'Val_Loss']
+
+    # --- 2. Initialisation ---
+    criterion_G = GeneratorLoss(device=device, lambda_pixel=1.0, lambda_percep=0.1, lambda_adv=0.01).to(device)
+    criterion_D = nn.BCEWithLogitsLoss().to(device)
+    
+    optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
+    
+    last_n_checkpoints = collections.deque(maxlen=5) 
+    start_epoch = 0
+    best_val_loss = float('inf')
+    best_model_path = os.path.join(checkpoint_dir, 'best_unet.pth')
+    
+    # --- 3. Reprise ---
+    if resume and os.path.exists(best_model_path):
+        print(f"Reprise depuis {best_model_path}")
+        checkpoint = torch.load(best_model_path, map_location=device)
+        if 'model_state' in checkpoint:
+            generator.load_state_dict(checkpoint['model_state'])
+            discriminator.load_state_dict(checkpoint['discriminator_state'])
+            best_val_loss = checkpoint.get('best_loss', float('inf'))
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            print(f" -> Reprise Epoch {start_epoch}")
+        else:
+            generator.load_state_dict(checkpoint)
+
+    # --- 4. Boucle ---
+    for epoch in range(start_epoch, start_epoch + epochs):
+        print(f"\nEPOCH {epoch+1}")
+        
+        # --- TRAIN ---
+        generator.train(); discriminator.train()
+        running_loss_G = 0.0; running_loss_D = 0.0
+        pixel_acc = 0.0; vgg_acc = 0.0; adv_acc = 0.0
+
+        loop = tqdm(train_loader, leave=True)
+        
+        for batch_idx, (noisy, clean, _) in enumerate(loop):
+            noisy, clean = noisy.to(device), clean.to(device)
+            
+            # Train D
+            optimizer_D.zero_grad()
+            pred_real = discriminator(clean)
+            loss_d_real = criterion_D(pred_real, torch.ones_like(pred_real))
+            pred_fake = discriminator(generator(noisy).detach())
+            loss_d_fake = criterion_D(pred_fake, torch.zeros_like(pred_fake))
+            loss_D = (loss_d_real + loss_d_fake) * 0.5
+            loss_D.backward()
+            optimizer_D.step()
+            running_loss_D += loss_D.item()
+            
+            # Train G
+            optimizer_G.zero_grad()
+            fake = generator(noisy)
+            pred_fake_G = discriminator(fake)
+            loss_G, l_pix, l_vgg, l_adv = criterion_G(fake, clean, pred_fake_G)
+            loss_G.backward()
+            optimizer_G.step()
+            
+            running_loss_G += loss_G.item()
+            pixel_acc += l_pix.item(); vgg_acc += l_vgg.item(); adv_acc += l_adv.item()
+
+            loop.set_description(f"Epoch [{epoch+1}/{epochs}]")
+            loop.set_postfix(loss_d=loss_D.item(), loss_g=loss_G.item())
+
+
+        # Moyennes Train
+        avg_loss_D = running_loss_D / len(train_loader)
+        avg_loss_G = running_loss_G / len(train_loader)
+        avg_pix = pixel_acc / len(train_loader)
+        avg_vgg = vgg_acc / len(train_loader)
+        avg_adv = adv_acc / len(train_loader)
+
+        # --- VALIDATION ---
+        generator.eval()
+        val_loss = 0.0
+        
+        # Stockage : {'gauss': {'psnr': [], 'ssim': []}, ...}
+        results_per_type = collections.defaultdict(lambda: {'psnr': [], 'ssim': []})
+        
+        print("Validation...")
+
+        loop = tqdm(val_loader, leave=True)
+        with torch.no_grad():
+            for noisy, clean, noise_types in loop:
+                noisy, clean = noisy.to(device), clean.to(device)
+                fake = generator(noisy)
+                
+                # 1. Val Loss
+                loss, _, _, _ = criterion_G(fake, clean, None)
+                val_loss += loss.item()
+                
+                # 2. Métriques individuelles
+                batch_psnrs, batch_ssims = calculate_metrics_individual(clean, fake)
+                
+                # 3. Répartition par bruit
+                for i, n_type in enumerate(noise_types):
+                    results_per_type[n_type]['psnr'].append(batch_psnrs[i])
+                    results_per_type[n_type]['ssim'].append(batch_ssims[i])
+                loop.set_description(f"Validation Epoch [{epoch+1}/{epochs}]")
+                loop.set_postfix(val_loss=val_loss)
+        
+        avg_val_loss = val_loss / len(val_loader)
+
+        # --- Calculs et Affichage ---
+        final_metrics = {}
+        global_psnr = []
+        global_ssim = []
+        
+        print(f"Epoch {epoch+1} Results (Val Loss: {avg_val_loss:.4f}):")
+        
+        # On parcourt les résultats par type
+        for n_type, metrics in results_per_type.items():
+            avg_p = np.mean(metrics['psnr'])
+            avg_s = np.mean(metrics['ssim'])
+            final_metrics[n_type] = {'psnr': avg_p, 'ssim': avg_s}
+            
+            global_psnr.extend(metrics['psnr'])
+            global_ssim.extend(metrics['ssim'])
+            print(f"  > {n_type:<8} | PSNR: {avg_p:.2f}dB | SSIM: {avg_s:.4f}")
+            
+        avg_psnr_global = np.mean(global_psnr)
+        avg_ssim_global = np.mean(global_ssim)
+        print(f"  > GLOBAL   | PSNR: {avg_psnr_global:.2f}dB | SSIM: {avg_ssim_global:.4f}")
+
+        # --- SAUVEGARDE CSV ---
+        # 1. Log Pertes
+        log_to_csv(loss_csv_path, 
+                   [epoch+1, avg_loss_D, avg_loss_G, avg_pix, avg_vgg, avg_adv, avg_val_loss], 
+                   header=loss_header, mode=csv_mode)
+        
+        # 2. Log Métriques
+        sorted_types = sorted(final_metrics.keys())
+        metrics_header = ['Epoch', 'Global_PSNR', 'Global_SSIM']
+        row_values = [epoch+1, avg_psnr_global, avg_ssim_global]
+        
+        for nt in sorted_types:
+            metrics_header.extend([f'PSNR_{nt}', f'SSIM_{nt}'])
+            row_values.extend([final_metrics[nt]['psnr'], final_metrics[nt]['ssim']])
+            
+        is_new = not os.path.exists(metrics_csv_path)
+        if is_new:
+            log_to_csv(metrics_csv_path, row_values, header=metrics_header, mode='w')
+        else:
+            log_to_csv(metrics_csv_path, row_values, header=None, mode='a')
+
+        csv_mode = 'a'
+
+        # --- Checkpoints ---
+        checkpoint_data = {
+            'epoch': epoch,
+            'model_state': generator.state_dict(),
+            'discriminator_state': discriminator.state_dict(),
+            'best_loss': best_val_loss,
+            'optimizer_G_state': optimizer_G.state_dict()
+        }
+        
+        # Save epoch checkpoint
+        current_ckpt_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth")
+        torch.save(checkpoint_data, current_ckpt_path)
+        
+        # Nettoyage anciens
+        all_ckpts = [f for f in os.listdir(checkpoint_dir) if f.startswith("checkpoint_epoch_")]
+        if len(all_ckpts) > 5:
+            all_ckpts.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+            for f in all_ckpts[:-5]:
+                os.remove(os.path.join(checkpoint_dir, f))
+
+        # Save Best
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            checkpoint_data['best_loss'] = best_val_loss
+            torch.save(checkpoint_data, best_model_path)
+            print(f"  Nouveau meilleur modèle sauvegardé")
+            
+    return
 
 
 # ============= Visualisation =============
@@ -392,7 +654,7 @@ def visualize_results(model, dataset, num_samples=3):
     
     with torch.no_grad():
         for i, idx in enumerate(indices):
-            noisy, clean = dataset[idx]
+            noisy, clean, _ = dataset[idx]
             noisy_input = noisy.unsqueeze(0).to(device)
             denoised = model(noisy_input).cpu().squeeze(0)
             
@@ -426,32 +688,28 @@ def visualize_results(model, dataset, num_samples=3):
 # ============= Script principal =============
 def main():
     # Configuration
-    DATA_DIR = "./image_database/patches"  # À adapter selon le dossier contenant vos patchs
-    BATCH_SIZE = 16
-    EPOCHS = 16
-    LEARNING_RATE = 1e-3
+    DATA_DIR = "../image_database/patches"  # À adapter selon le dossier contenant vos patchs
+    BATCH_SIZE = 32
+    EPOCHS = 50
+    LEARNING_RATE = 2e-4
     TRAIN_SPLIT = 0.8
     RESUME_TRAINING = False  # Mettre True pour continuer un entraînement
-    MODEL_PATH = "unet_denoiser.pth"  # Chemin du modèle à charger
-
-    print("debut 1")
+    MODEL_PATH_G = 'unet_denoiser.pth'
+    MODEL_PATH_D = 'discriminator.pth'
+    CHECKPOINT_DIR = './checkpoints_gan'
     
     # Transformations
     transform = transforms.Compose([
         transforms.ToTensor(),
     ])
-
-    print("debut 2")
     
     # Charger le dataset
     full_dataset = DenoisingDataset(
         clean_dir=DATA_DIR,
-        noise_types=['gauss', 'poisson', 'sap', 'speckle'],
+        noise_types=['gauss', 'poisson', 'sap', 'speckle', 'gauss_weak', 'gauss_strong'],
         transform=transform,
-        num_images=637965 # À adapter au nombre de patchs dans le dossier /patches
+        num_images=49530 # À adapter au nombre de patchs dans le dossier /patches
     )
-
-    print("debut 3")
     
     # Diviser en train/val
     train_size = int(TRAIN_SPLIT * len(full_dataset))
@@ -467,42 +725,57 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
     
     # Créer le modèle
-    model = UNet(in_channels=3, out_channels=3).to(device)
+    generator = UNet(in_channels=3, out_channels=3).to(device)
+    discriminator = Discriminator(input_channels=3).to(device)
     
-    # Charger les poids si on continue un entraînement
-    if RESUME_TRAINING and os.path.exists(MODEL_PATH):
-        print(f"\n=== Chargement du modèle existant: {MODEL_PATH} ===")
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-        print("✓ Modèle chargé avec succès! Continuation de l'entraînement...\n")
+    # Chargement des poids si on continue un entraînement
+    if RESUME_TRAINING:
+        print(f"\n=== Tentative de chargement des checkpoints ===")
+        
+        # Charger Générateur
+        if os.path.exists(MODEL_PATH_G):
+            generator.load_state_dict(torch.load(MODEL_PATH_G, map_location=device))
+            print(f"✓ Générateur chargé: {MODEL_PATH_G}")
+        else:
+            print(f"x Pas de générateur trouvé, démarrage à zéro.")
+
+        # Charger Discriminateur
+        if os.path.exists(MODEL_PATH_D):
+            discriminator.load_state_dict(torch.load(MODEL_PATH_D, map_location=device))
+            print(f"Discriminateur chargé: {MODEL_PATH_D}")
+        else:
+            print(f"Pas de discriminateur trouvé, initialisation aléatoire.")
+            
+        print("Continuation de l'entraînement...\n")
+
     else:
-        print(f"\nModèle créé avec {sum(p.numel() for p in model.parameters())} paramètres")
+        print(f"\nModèles créés (G: {sum(p.numel() for p in generator.parameters())} params)")
     
     # Entraîner
     print("\n=== Début de l'entraînement ===\n")
-    train_losses, val_losses = train_model(
-        model, train_loader, val_loader, full_dataset,
-        epochs=EPOCHS, lr=LEARNING_RATE
+
+    train_gan_model_advanced(
+        generator, discriminator, 
+        train_loader, val_loader, 
+        epochs=EPOCHS, 
+        resume=RESUME_TRAINING, 
+        checkpoint_dir=CHECKPOINT_DIR,
+        device=device
     )
     
-    # Visualiser les résultats
+    # --- Récupération des données ---
+
     print("\n=== Visualisation des résultats ===\n")
-    model.load_state_dict(torch.load('unet_denoiser.pth'))
-    visualize_results(model, full_dataset, num_samples=10)
 
-    
-    
-    # Plot des pertes
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.title('Évolution de la perte durant l\'entraînement')
-    plt.grid(True)
-    plt.savefig('training_curves.png', dpi=150, bbox_inches='tight')
-    plt.show()
+    # 1. Chargement du meilleur Générateur
+    generator.load_state_dict(torch.load('unet_denoiser.pth', map_location=device))
+    generator.eval()
 
+    # 2. Visualisation des images
+    visualize_results(generator, full_dataset, num_samples=10)
+
+    # 3. Plot des courbes
+    plt.figure(figsize=(15, 6))
 
 if __name__ == "__main__":
     main()
