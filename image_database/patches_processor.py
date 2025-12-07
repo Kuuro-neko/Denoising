@@ -98,6 +98,16 @@ class ImagePatchGenerator:
                 str(self.dirs['gaussian'] / f"gauss_{patch_number:06d}.jpg"),
                 self.add_gaussian_noise(patch)
             )
+
+            cv2.imwrite(
+                str(self.dirs['gaussian'] / f"gauss_weak_{patch_number:06d}.jpg"),
+                self.add_gaussian_noise(patch, std=10)
+            )
+
+            cv2.imwrite(
+                str(self.dirs['gaussian'] / f"gauss_strong_{patch_number:06d}.jpg"),
+                self.add_gaussian_noise(patch, std=50)
+            )
             
             cv2.imwrite(
                 str(self.dirs['poisson'] / f"poisson_{patch_number:06d}.jpg"),
@@ -144,7 +154,7 @@ class ImagePatchGenerator:
 
 def main():
     # Configuration
-    INPUT_DIR = "./flickr_images"  # Dossier contenant les images Flickr
+    INPUT_DIR = "./flickr30k_images/flickr30k_images"  # Dossier contenant les images Flickr
     OUTPUT_DIR = "./patches"        # Dossier de sortie pour les patchs
     PATCH_SIZE = 125
     
