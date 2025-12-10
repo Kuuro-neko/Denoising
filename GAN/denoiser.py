@@ -228,7 +228,7 @@ def denoise_full_image(image_tensor, model, device):
 
 
 # ============= SCRIPT PRINCIPAL : Débruiter une image =============
-def denoise_image(image_path, model_path="unet.pth", save_path=None, method="patches"):
+def denoise_image(image_path, model_path="gan.pth", save_path=None, method="patches"):
     """
     Applique le modèle de débruitage sur une image
     
@@ -321,7 +321,7 @@ def denoise_image(image_path, model_path="unet.pth", save_path=None, method="pat
 
 
 # ============= DEBRUITAGE D'UN DOSSIER =============
-def denoise_folder(input_folder, output_folder, model_path="unet.pth", method="patches"):
+def denoise_folder(input_folder, output_folder, model_path="gan.pth", method="patches"):
     """
     Débruite toutes les images d'un dossier
     

@@ -35,8 +35,8 @@ def denoise_image(image_path, model_path, output_path):
 
 if __name__ == "__main__":
     # Paths
-    image_path = "../image_database/patches/000001.jpg"  # Path to the noisy input image
-    model_path = "../unet_gan_generator.pth"  # Path to the saved generator model
+    image_path = "./image_database/patches/000001.jpg"  # Path to the noisy input image
+    model_path = "./gan.pth"  # Path to the saved generator model
     output_path = "denoised_image.jpg"  # Path to save the denoised image
 
     # Denoise the image
